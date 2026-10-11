@@ -550,7 +550,7 @@ function playTrack(i) {
     const remaining = Number.isFinite(outgoing.duration)
       ? Math.max(0, outgoing.duration - outgoing.currentTime)
       : crossfadeDuration;
-    const fadeSeconds = Math.min(crossfadeDuration, remaining * 0.45);
+    const fadeSeconds = Math.min(crossfadeDuration, remaining);
     incoming.pause();
     incoming.src = track.localPath;
     incoming.volume = 0;

@@ -70,6 +70,15 @@ const dropOverlay = document.getElementById('drop-overlay');
 const trackContextMenu = document.getElementById('track-context-menu');
 
 let audio = new Audio();
+let standbyAudio = new Audio();
+const audioDecks = [audio, standbyAudio];
+let crossfadeDuration = 2;
+let playbackRequestId = 0;
+let crossfadeToken = 0;
+let crossfadeOutgoing = null;
+let pendingIncomingAudio = null;
+let autoCrossfadeStartedFor = null;
+const crossfadeSelect = document.getElementById('crossfade-select');
 let tracks = [];
 let playlists = [];
 let activeIndex = -1;
@@ -136,8 +145,11 @@ function applyUICfg() {
   }
   if (cfg.search) searchInput.value = cfg.search;
   if (cfg.sort) sortSelect.value = cfg.sort;
+  if ([0, 1, 2, 3, 5].includes(Number(cfg.crossfade))) crossfadeDuration = Number(cfg.crossfade);
+  if (crossfadeSelect) crossfadeSelect.value = String(crossfadeDuration);
   if (cfg.volume !== undefined) {
     audio.volume = cfg.volume;
+    standbyAudio.volume = cfg.volume;
     videoPlayer.volume = cfg.volume;
     volumeFill.style.width = `${cfg.volume * 100}%`;
     updateVolumeIcon(cfg.volume);
@@ -145,6 +157,13 @@ function applyUICfg() {
 }
 
 applyUICfg();
+
+if (crossfadeSelect) crossfadeSelect.addEventListener('change', () => {
+  crossfadeDuration = Number(crossfadeSelect.value) || 0;
+  const cfg = loadUICfg();
+  cfg.crossfade = crossfadeDuration;
+  saveUICfg(cfg);
+});
 
 // =========================================================
 // INIT
@@ -470,13 +489,109 @@ if (trackContextMenu) {
 // PLAY TRACK
 // =========================================================
 
+function getConfiguredVolume() {
+  const volume = Number(loadUICfg().volume);
+  return Number.isFinite(volume) ? Math.max(0, Math.min(1, volume)) : 1;
+}
+
+function crossfadeDecks(outgoing, incoming, durationMs, requestId) {
+  const token = ++crossfadeToken;
+  crossfadeOutgoing = outgoing;
+  const startVolume = outgoing.volume;
+  const startedAt = performance.now();
+  return new Promise(resolve => {
+    const finish = () => {
+      if (requestId !== playbackRequestId || token !== crossfadeToken) return resolve();
+      incoming.volume = getConfiguredVolume();
+      outgoing.pause();
+      outgoing.src = '';
+      outgoing.load();
+      if (crossfadeOutgoing === outgoing) crossfadeOutgoing = null;
+      resolve();
+    };
+    if (document.hidden || durationMs <= 0) {
+      outgoing.volume = 0;
+      return finish();
+    }
+    const step = () => {
+      if (requestId !== playbackRequestId || token !== crossfadeToken) return resolve();
+      const progress = Math.min(1, (performance.now() - startedAt) / durationMs);
+      outgoing.volume = startVolume * (1 - progress);
+      incoming.volume = getConfiguredVolume() * progress;
+      if (progress < 1) requestAnimationFrame(step);
+      else finish();
+    };
+    step();
+  });
+}
+
 function playTrack(i) {
   if (i < 0 || i >= tracks.length) return;
-  activeIndex = i;
-  const track = tracks[i];
-  updateFeaturedCard(track);
+  const requestId = ++playbackRequestId;
+  crossfadeToken++;
+  if (pendingIncomingAudio) {
+    pendingIncomingAudio.pause();
+    pendingIncomingAudio.src = '';
+    pendingIncomingAudio.load();
+    pendingIncomingAudio = null;
+  }
+  if (crossfadeOutgoing && crossfadeOutgoing !== audio) {
+    crossfadeOutgoing.pause();
+    crossfadeOutgoing.src = '';
+    crossfadeOutgoing.load();
+  }
+  crossfadeOutgoing = null;
 
+  const track = tracks[i];
+  const canCrossfade = crossfadeDuration > 0 && !audio.paused && activeIndex !== i && track.type !== 'video';
+  if (canCrossfade) {
+    const outgoing = audio;
+    const incoming = standbyAudio;
+    const remaining = Number.isFinite(outgoing.duration)
+      ? Math.max(0, outgoing.duration - outgoing.currentTime)
+      : crossfadeDuration;
+    const fadeSeconds = Math.min(crossfadeDuration, remaining);
+    incoming.pause();
+    incoming.src = track.localPath;
+    incoming.volume = 0;
+    incoming.muted = outgoing.muted;
+    incoming.load();
+    pendingIncomingAudio = incoming;
+    incoming.play().then(() => {
+      if (requestId !== playbackRequestId || pendingIncomingAudio !== incoming) { incoming.pause(); incoming.src = ''; return; }
+      pendingIncomingAudio = null;
+      audio = incoming;
+      standbyAudio = outgoing;
+      activeIndex = i;
+      autoCrossfadeStartedFor = null;
+      updateFeaturedCard(track);
+      document.getElementById('np-cover').src = track.cover || '';
+      document.getElementById('np-title').textContent = track.title;
+      document.getElementById('np-artist').textContent = track.artist;
+      updateMainHeart();
+      renderTracks();
+      updatePlayUI(true);
+      fetchLyrics(track.artist, track.title);
+      crossfadeDecks(outgoing, incoming, fadeSeconds * 1000, requestId);
+    }).catch(() => {
+      if (pendingIncomingAudio === incoming) pendingIncomingAudio = null;
+      if (requestId !== playbackRequestId) return;
+      incoming.pause();
+      incoming.src = '';
+      outgoing.volume = getConfiguredVolume();
+      autoCrossfadeStartedFor = null;
+      showToast('Could not play this track. Check that the file is available.', 'error');
+    });
+    return;
+  }
+
+  activeIndex = i;
+  autoCrossfadeStartedFor = null;
+  updateFeaturedCard(track);
   if (track.type === 'video') {
+    audio.pause();
+    standbyAudio.pause();
+    videoPlayer.pause();
     document.getElementById('np-cover').src = track.cover || '';
     document.getElementById('np-title').textContent = track.title;
     document.getElementById('np-artist').textContent = track.artist;
@@ -485,9 +600,13 @@ function playTrack(i) {
     return;
   }
 
+  audio.volume = getConfiguredVolume();
   audio.src = track.localPath;
   audio.load();
-  audio.play().then(() => updatePlayUI(true)).catch(e => console.error(e));
+  audio.play().then(() => updatePlayUI(true)).catch(() => {
+    updatePlayUI(false);
+    showToast('Could not play this track. Check that the file is available.', 'error');
+  });
 
   document.getElementById('np-cover').src = track.cover || '';
   document.getElementById('np-title').textContent = track.title;
@@ -533,7 +652,25 @@ function togglePlayPause() {
     return;
   }
   if (audio.paused) { audio.play(); updatePlayUI(true); }
-  else { audio.pause(); updatePlayUI(false); }
+  else {
+    if (pendingIncomingAudio) {
+      playbackRequestId++;
+      crossfadeToken++;
+      pendingIncomingAudio.pause();
+      pendingIncomingAudio.src = '';
+      pendingIncomingAudio.load();
+      pendingIncomingAudio = null;
+    }
+    if (crossfadeOutgoing) {
+      crossfadeToken++;
+      crossfadeOutgoing.pause();
+      crossfadeOutgoing.src = '';
+      crossfadeOutgoing.load();
+      crossfadeOutgoing = null;
+      audio.volume = getConfiguredVolume();
+    }
+    audio.pause(); updatePlayUI(false);
+  }
 }
 
 playBtn.addEventListener('click', togglePlayPause);
@@ -573,10 +710,12 @@ repeatBtn.addEventListener('click', () => {
   repeatBtn.classList.toggle('active-toggle', isRepeat);
 });
 
-audio.addEventListener('ended', () => {
-  if (isRepeat) { audio.currentTime = 0; audio.play(); }
+audioDecks.forEach(deck => deck.addEventListener('ended', () => {
+  if (deck !== audio) return;
+  if (autoCrossfadeStartedFor === String(tracks[activeIndex]?.id)) return;
+  if (isRepeat) { deck.currentTime = 0; deck.play(); }
   else handleNextTrack();
-});
+}));
 
 // =========================================================
 // MINI PLAYER
@@ -631,7 +770,7 @@ document.addEventListener('keydown', (e) => {
   else if (e.code === 'KeyF' && e.ctrlKey) { e.preventDefault(); switchTab('library'); searchInput.focus(); }
   else if (e.code === 'KeyL' && e.ctrlKey) { e.preventDefault(); lyricsBtn.click(); }
   else if (e.code === 'KeyN' && e.ctrlKey) { e.preventDefault(); btnCreatePlaylist.click(); }
-  else if (e.code === 'KeyM' && e.ctrlKey) { e.preventDefault(); audio.muted = !audio.muted; videoPlayer.muted = audio.muted; }
+  else if (e.code === 'KeyM' && e.ctrlKey) { e.preventDefault(); audio.muted = !audio.muted; standbyAudio.muted = audio.muted; videoPlayer.muted = audio.muted; }
   else if (e.code === 'KeyS' && e.ctrlKey) { e.preventDefault(); switchTab('settings'); }
   else if (e.code === 'Escape') {
     if (videoModal.style.display === 'flex') closeVideoBtn.click();
@@ -702,9 +841,10 @@ function renderSyncedLyrics() {
   });
 }
 
-audio.addEventListener('timeupdate', () => {
+audioDecks.forEach(deck => deck.addEventListener('timeupdate', () => {
+  if (deck !== audio) return;
   if (parsedLyrics.length === 0) return;
-  const curTime = audio.currentTime;
+  const curTime = deck.currentTime;
   let activeIdx = -1;
   for (let i = 0; i < parsedLyrics.length; i++) {
     if (curTime >= parsedLyrics[i].time) activeIdx = i;
@@ -718,7 +858,7 @@ audio.addEventListener('timeupdate', () => {
       currentLine.scrollIntoView({ behavior: 'smooth', block: 'center' });
     }
   }
-});
+}));
 
 // =========================================================
 // HEART
@@ -854,14 +994,22 @@ setupDraggableSlider(sliderBg, (pos) => {
   }
 });
 
-audio.addEventListener('timeupdate', () => {
-  if (audio.duration && !sliderBg.classList.contains('dragging')) {
-    const pct = (audio.currentTime / audio.duration) * 100;
+audioDecks.forEach(deck => deck.addEventListener('timeupdate', () => {
+  if (deck !== audio) return;
+  if (deck.duration && !sliderBg.classList.contains('dragging')) {
+    const pct = (deck.currentTime / deck.duration) * 100;
     sliderFill.style.width = `${pct}%`;
-    currTime.textContent = formatTime(audio.currentTime);
-    durTime.textContent = formatTime(audio.duration);
+    currTime.textContent = formatTime(deck.currentTime);
+    durTime.textContent = formatTime(deck.duration);
   }
-});
+  if (crossfadeDuration > 0 && !isRepeat && !deck.paused && Number.isFinite(deck.duration) && activeIndex >= 0) {
+    const trackId = String(tracks[activeIndex]?.id);
+    if (deck.duration - deck.currentTime <= crossfadeDuration && autoCrossfadeStartedFor !== trackId) {
+      autoCrossfadeStartedFor = trackId;
+      handleNextTrack();
+    }
+  }
+}));
 
 function updateVolumeIcon(v) {
   if (v === 0) volumeIcon.className = 'fa-solid fa-volume-xmark';

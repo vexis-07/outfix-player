@@ -76,6 +76,7 @@ let crossfadeDuration = 2;
 let playbackRequestId = 0;
 let crossfadeToken = 0;
 let crossfadeOutgoing = null;
+let pendingIncomingAudio = null;
 let autoCrossfadeStartedFor = null;
 const crossfadeSelect = document.getElementById('crossfade-select');
 let tracks = [];
@@ -528,6 +529,12 @@ function playTrack(i) {
   if (i < 0 || i >= tracks.length) return;
   const requestId = ++playbackRequestId;
   crossfadeToken++;
+  if (pendingIncomingAudio) {
+    pendingIncomingAudio.pause();
+    pendingIncomingAudio.src = '';
+    pendingIncomingAudio.load();
+    pendingIncomingAudio = null;
+  }
   if (crossfadeOutgoing && crossfadeOutgoing !== audio) {
     crossfadeOutgoing.pause();
     crossfadeOutgoing.src = '';
@@ -547,9 +554,12 @@ function playTrack(i) {
     incoming.pause();
     incoming.src = track.localPath;
     incoming.volume = 0;
+    incoming.muted = outgoing.muted;
     incoming.load();
+    pendingIncomingAudio = incoming;
     incoming.play().then(() => {
-      if (requestId !== playbackRequestId) { incoming.pause(); incoming.src = ''; return; }
+      if (requestId !== playbackRequestId || pendingIncomingAudio !== incoming) { incoming.pause(); incoming.src = ''; return; }
+      pendingIncomingAudio = null;
       audio = incoming;
       standbyAudio = outgoing;
       activeIndex = i;
@@ -564,6 +574,7 @@ function playTrack(i) {
       fetchLyrics(track.artist, track.title);
       crossfadeDecks(outgoing, incoming, fadeSeconds * 1000, requestId);
     }).catch(() => {
+      if (pendingIncomingAudio === incoming) pendingIncomingAudio = null;
       if (requestId !== playbackRequestId) return;
       incoming.pause();
       incoming.src = '';
@@ -642,6 +653,14 @@ function togglePlayPause() {
   }
   if (audio.paused) { audio.play(); updatePlayUI(true); }
   else {
+    if (pendingIncomingAudio) {
+      playbackRequestId++;
+      crossfadeToken++;
+      pendingIncomingAudio.pause();
+      pendingIncomingAudio.src = '';
+      pendingIncomingAudio.load();
+      pendingIncomingAudio = null;
+    }
     if (crossfadeOutgoing) {
       crossfadeToken++;
       crossfadeOutgoing.pause();
